@@ -1,14 +1,21 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 from typing import Iterator, Tuple, Any
 from scipy.spatial.transform import Rotation
 import pickle
+
+import PIL
 
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_hub as hub
 import re
+
+from tqdm import tqdm
+
 
 class Bridge(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for example dataset."""
@@ -112,7 +119,7 @@ class Bridge(tfds.core.GeneratorBasedBuilder):
                         dtype=np.bool_,
                         doc='True on last step of the episode if it is a terminal step, True for demos.'
                     ),
-                    'language_instruction': tfds.features.Text(
+                    'language_instruction_0': tfds.features.Text(
                         doc='Language Instruction. utf-8 encoded data from files'
                             'empty byte stream if has_language is false'
                     ),
@@ -128,6 +135,19 @@ class Bridge(tfds.core.GeneratorBasedBuilder):
                         doc='Language Instruction. utf-8 encoded data from files'
                             'empty byte stream if has_language is false'
                     ),
+                    'groundtruth_0': tfds.features.Text(
+                        doc='Groundtruth Language Instruction. utf-8 encoded data from files'
+
+                    ),
+                    'groundtruth_1': tfds.features.Text(
+                        doc='Groundtruth Language Instruction. utf-8 encoded data from files'
+
+                    ),
+                    'groundtruth_2': tfds.features.Text(
+                        doc='Groundtruth Language Instruction. utf-8 encoded data from files'
+
+                    ),
+
                     'language_embedding': tfds.features.Tensor(
                         shape=(1, 512),
                         dtype=np.float32,
@@ -218,30 +238,48 @@ class Bridge(tfds.core.GeneratorBasedBuilder):
 def _parse_example(episode_path, embed=None):
     data = {}
 
+    lupus_path = os.path.join(episode_path, "annotations", "lang_lupus.txt")
+    if not os.path.exists(lupus_path):
+        return None
+
     # check if "lang_lupus" exists in traj
     lupus_path = os.path.join(episode_path, "annotations", "lang_lupus.txt")
     lang_txt_path = os.path.join(episode_path, "lang.txt")
-    if not os.path.isfile(lupus_path) and not os.path.isfile(lang_txt_path):
-        return None
+    # if not os.path.isfile(lupus_path) and not os.path.isfile(lang_txt_path):
+    #     return None
 
     for data_field in os.listdir(episode_path):
+        if "agent_data" in data_field:
+            continue
         data_field_full_path = os.path.join(episode_path, data_field)
         if os.path.isdir(data_field_full_path):
             if data_field == "annotations": # extract "lang_lupus"
                 for lupus_annotation in os.listdir(data_field_full_path):
                     if lupus_annotation == "lang_lupus.txt":
+
                         with open(os.path.join(data_field_full_path, lupus_annotation), 'rb') as f:
-                            lang_lupus = {"lang_lupus": f.read()}
+                            lang = f.read()
+                            lang = lang.decode("utf-8")
+                            lang = lang.split("\n")
+                            lang = [line.strip() for line in lang if "confidence" not in line]
+                            lang_lupus = {"lang_lupus":lang}
                             data.update(lang_lupus)
             else:
                 cam1_image_vector = create_img_vector(data_field_full_path)
                 data.update({data_field: cam1_image_vector})
         elif data_field == "lang.txt":
             with open(data_field_full_path, 'rb') as f:
-                lang_txt = {"lang": f.read()}
+
+                lang = f.read()
+                lang = lang.decode("utf-8")
+                lang = lang.split("\n")
+                lang = [line.strip() for line in lang if "confidence" not in line]
+                lang_txt = {"lang":lang}
                 data.update(lang_txt)
         else:
+
             data.update({data_field[:data_field.find(".")]: np.load(data_field_full_path, allow_pickle=True)})
+
 
     # agent_data : dict_keys(['traj_ok', 'camera_info', 'term_t', 'stats'])
     # policy_out : dict_keys(['actions', 'new_robot_transform', 'delta_robot_transform', 'policy_type'])
@@ -256,6 +294,15 @@ def _parse_example(episode_path, embed=None):
     #     else:
     #         print(value)
 
+
+    for i in range(len(data["policy_out"])-1):
+        diff = data["obs_dict"]["state"][i+1] - data["obs_dict"]["state"][i]
+        act = data["policy_out"][i]["actions"]
+
+        print("diff: ", diff)
+        print("act: ", act)
+
+
     trajectory_length = data["agent_data"]["term_t"] if "agent_data" in data else len(data["policy_out"])
     has_depth_0 = "depth_images0" in data
     has_image_0 = "images0" in data
@@ -266,18 +313,22 @@ def _parse_example(episode_path, embed=None):
     has_groundtruth = "lang" in data
 
     if has_language:
-        lang_str = data["lang_lupus"].decode("utf-8")
-        lupus_array = preprocess_string(lang_str)
-        if len(lupus_array) < 12:
-            to_fill = 12 - len(lupus_array)
+        #lang_str = data["lang_lupus"].decode("utf-8")
+        lupus_array = data["lang_lupus"]
+
+        if len(lupus_array) < 3:
+            to_fill = 3 - len(lupus_array)
             for i in range(to_fill):
                 lupus_array.append(lupus_array[i])
 
+        #sort array by length
+        lupus_array = sorted(lupus_array, key=len)
+
     if has_groundtruth:
-        lang_str = data["lang"].decode("utf-8")
-        lang_array = preprocess_string(lang_str)
-        if len(lang_array) < 12:
-            to_fill = 12 - len(lang_array)
+        #lang_str = data["lang"].decode("utf-8")
+        lang_array = data["lang"]
+        if len(lang_array) < 3:
+            to_fill = 3 - len(lang_array)
             for i in range(to_fill):
                 lang_array.append(lang_array[i])
 
@@ -314,30 +365,12 @@ def _parse_example(episode_path, embed=None):
             'is_first': i == 0,
             'is_last': i == (trajectory_length - 1),
             'is_terminal': i == (trajectory_length - 1),
-            'language_instruction': lupus_array[0] if has_language else b'',
+            'language_instruction_0': lupus_array[0] if has_language else b'',
             'language_instruction_1': lupus_array[1] if has_language else b'',
             'language_instruction_2': lupus_array[2] if has_language else b'',
-            'language_instruction_3': lupus_array[3] if has_language else b'',
-            'language_instruction_4': lupus_array[4] if has_language else b'',
-            'language_instruction_5': lupus_array[5] if has_language else b'',
-            'language_instruction_6': lupus_array[6] if has_language else b'',
-            'language_instruction_7': lupus_array[7] if has_language else b'',
-            'language_instruction_8': lupus_array[8] if has_language else b'',
-            'language_instruction_9': lupus_array[9] if has_language else b'',
-            'language_instruction_10': lupus_array[10] if has_language else b'',
-            'language_instruction_11': lupus_array[11] if has_language else b'',
-            'groundtruth': lang_array[0] if has_groundtruth else b'',
+            'groundtruth_0': lang_array[0] if has_groundtruth else b'',
             'groundtruth_1': lang_array[1] if has_groundtruth else b'',
             'groundtruth_2': lang_array[2] if has_groundtruth else b'',
-            'groundtruth_3': lang_array[3] if has_groundtruth else b'',
-            'groundtruth_4': lang_array[4] if has_groundtruth else b'',
-            'groundtruth_5': lang_array[5] if has_groundtruth else b'',
-            'groundtruth_6': lang_array[6] if has_groundtruth else b'',
-            'groundtruth_7': lang_array[7] if has_groundtruth else b'',
-            'groundtruth_8': lang_array[8] if has_groundtruth else b'',
-            'groundtruth_9': lang_array[9] if has_groundtruth else b'',
-            'groundtruth_10': lang_array[10] if has_groundtruth else b'',
-            'groundtruth_11': lang_array[11] if has_groundtruth else b'',
             'language_embedding': language_embedding,
         })
 
@@ -375,15 +408,40 @@ def preprocess_string(unfiltered_str: str) -> list:
       
     return lang_array
 
+
+
+
+
 def sorted_alphanumeric(data):
     convert = lambda text: int(text) if text.isdigit() else text.lower()
     alphanum_key = lambda key: [ convert(c) for c in re.split('([0-9]+)', key) ] 
     return sorted(data, key=alphanum_key)
 
+
+def load_image(image_path):
+    image = PIL.Image.open(image_path)
+    image = np.array(image)
+    return image
+
 def create_img_vector(img_folder_path):
     cam_list = []
     cam_path_list = []
     dir_list_sorted = sorted_alphanumeric(os.listdir(img_folder_path))
+
+    #only keep files with img extension
+    dir_list_sorted_images = [os.path.join(img_folder_path,path) for path in dir_list_sorted if path.endswith(('.png', '.jpg', '.jpeg'))]
+
+    cam_list = [load_image(img_path) for img_path in dir_list_sorted_images]
+    return cam_list
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        images = list((executor.map(load_image, dir_list_sorted_images)))
+
+    cam_list = images
+    return cam_list
+
+
+
     for img_name in dir_list_sorted:
         ext = img_name[img_name.find("."):]
         if ext == '.png' or ext == '.jpg' or ext == '.jpeg':
@@ -401,12 +459,16 @@ def get_trajectorie_paths_recursive(directory, sub_dir_list):
     # return subdirectories
 
 if __name__ == "__main__":
-    data_path = "/home/marcelr/BridgeData/raw"
-    embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-large/5")
+    data_path = "/home/DATA_SHARE/bridge_data"
+    #embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-large/5")
+    embed = None
     raw_dirs = []
     counter = 0
     get_trajectorie_paths_recursive(data_path, raw_dirs)
     raw_dirs.reverse() # '/home/marcelr/BridgeData/raw/datacol1_toykitchen1/many_skills/09/2023-03-15_15-11-20/raw' '/home/marcelr/BridgeData/raw/datacol1_toykitchen1/many_skills/09/2023-03-15_15-11-20/raw'
+
+    pb = tqdm(total=50000)
+
     for raw_dir in raw_dirs:
         for traj_group in os.listdir(raw_dir):
             traj_group_full_path = os.path.join(raw_dir, traj_group)
@@ -416,7 +478,7 @@ if __name__ == "__main__":
                     if os.path.isdir(traj_dir_full_path):
                         counter += 1
                         _parse_example(traj_dir_full_path, embed)
-                        print(counter)
+                        pb.update(1)
                     else:
                         print("non dir instead of traj found!")
             else:
